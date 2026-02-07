@@ -1,0 +1,12 @@
+accelerate
+bitsandbytes
+datasets==4.0.0
+fastapi==0.115.7
+importlib_metadata==8.4.0
+pandas==2.2.3
+peft
+pydantic==2.11.4
+PyYAML
+scikit-learn==1.6.1
+tqdm==4.67.1
+transformers==4.57.3

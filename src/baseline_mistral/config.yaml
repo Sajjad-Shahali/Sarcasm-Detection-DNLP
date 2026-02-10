@@ -1,0 +1,68 @@
+# config.yaml
+# Single source of truth. main.py contains NO hard defaults.
+# CLI precedence: CLI flags > this config file
+
+common:
+  device: auto          # auto | cuda | cpu
+
+train:
+  model_name: mistralai/Mistral-Small-Instruct-2409
+  task: Sarcasm          # Sarcasm | Sentiment
+  train_file: ../dataset/train.csv
+  valid_file: ../dataset/valid.csv
+  output_dir: ./model_output
+
+  #learning_rates: [1.0e-5, 2.0e-5, 3.0e-5]     //[1.0e-5]
+  learning_rates: [1.0e-5]
+  batch_size: 8
+  eval_batch_size: null      # null => use batch_size
+  num_epochs: 1
+  weight_decay: 0.01
+  seed: 42
+
+  num_workers: 2
+  pin_memory: true
+  grad_accum_steps: 1
+  max_length: 256
+  log_every_seconds: 1
+
+  checkpoint_every_epochs: 2
+  resume_from_checkpoint: true
+  checkpoint_dir: null
+
+  # Decoder fine-tuning (QLoRA)
+  use_qlora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: all-linear
+
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  compute_dtype: bf16        # bf16 | fp16
+
+  prompt_sentiment: "Generate the sentiment of the given text. 1 for positive sentiment, and 0 for negative sentiment. Do not give an explanation."
+  prompt_sarcasm: "Predict if the given text is sarcastic. 1 if the text is sarcastic, and 0 if the text is not sarcastic. Do not give an explanation."
+  prompt_template: "{prompt}\n{text}\n"
+
+  fp16: false
+  bf16: false
+  tf32: false
+
+predict:
+  checkpoint_dir: ./model_output
+  task: Sarcasm
+  input_file: null          # set a CSV path to batch predict
+  output_file: null         # optional; if null, auto-generates <input>_predictions.csv
+  text: []                  # list of strings for single prediction mode
+
+  device: auto              # optional override for predict only
+  batch_size: 32
+  max_length: 256
+  max_new_tokens: 1
+  fp16: false
+  bf16: false
+
+  prompt_sentiment: "Generate the sentiment of the given text. 1 for positive sentiment, and 0 for negative sentiment. Do not give an explanation."
+  prompt_sarcasm: "Predict if the given text is sarcastic. 1 if the text is sarcastic, and 0 if the text is not sarcastic. Do not give an explanation."
+  prompt_template: "{prompt}\n{text}\n"

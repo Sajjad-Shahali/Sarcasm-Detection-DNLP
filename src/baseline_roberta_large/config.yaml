@@ -16,7 +16,7 @@ train:
   learning_rates: [1.0e-5]
   batch_size: 8
   eval_batch_size: null      # null => use batch_size
-  num_epochs: 1
+  num_epochs: 5
   weight_decay: 0.01
   seed: 42
   use_class_weights: true

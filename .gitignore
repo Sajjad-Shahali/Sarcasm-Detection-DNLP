@@ -216,3 +216,8 @@ src/model_output/
 **/__pycache__/
 /output_models/
 main_2.ipynb
+/src/baseline_distilbert/model_output
+/src/baseline_roberta_large/model_output
+/src/besstie_decoder_extension/models
+/src/besstie_decoder_extension/model_output
+/src/dataset_translated_vaat/model_output

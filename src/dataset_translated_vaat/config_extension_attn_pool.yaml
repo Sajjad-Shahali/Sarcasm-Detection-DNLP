@@ -1,0 +1,5 @@
+# config.yaml (ONLY the extra lines you add under train:)
+train:
+  decoder_type: attn_pool
+  decoder_dropout: 0.1
+  attn_mlp_hidden: null   # or 256 for a tiny MLP scorer

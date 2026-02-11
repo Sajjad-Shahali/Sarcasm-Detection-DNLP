@@ -1,0 +1,49 @@
+common:
+  device: auto
+train:
+  model_name: roberta-large
+  task: Sarcasm
+  train_file: ./dataset/train-new.csv
+  valid_file: ./dataset/valid-new.csv
+  output_dir: ./model_output
+  learning_rates:
+  - 1.0e-05
+  - 2.0e-05
+  - 3.0e-05
+  batch_size: 8
+  eval_batch_size: null
+  num_epochs: 30
+  weight_decay: 0.01
+  seed: 42
+  use_class_weights: true
+  num_workers: 0
+  pin_memory: true
+  grad_accum_steps: 1
+  max_length: 256
+  fp16: false
+  bf16: false
+  tf32: false
+  decoder_type: vaat
+  decoder_dropout: 0.1
+  cnn_num_filters: 128
+  cnn_kernel_sizes:
+  - 2
+  - 3
+  - 4
+  attn_mlp_hidden: null
+  vaat_adapter_dim: 64
+  vaat_freeze_encoder: true
+  early_stopping: true
+  patience: 5
+  min_delta: 0.001
+  monitor: f1_macro
+predict:
+  checkpoint_dir: ./model_output
+  input_file: null
+  output_file: null
+  text: []
+  device: auto
+  batch_size: 32
+  max_length: 256
+  fp16: false
+  bf16: false

@@ -1,0 +1,3 @@
+model,num_samples,accuracy,f1_macro,precision,recall,tp,fp,fn,tn
+Robertalarge_VAAT,2428,0.5831960461285008,0.48550489758826754,0.30084033613445377,0.23096774193548386,179.0,416.0,596.0,1237.0
+Robertalarge_VAAT,2428,,9.939152974469657,,,,,,

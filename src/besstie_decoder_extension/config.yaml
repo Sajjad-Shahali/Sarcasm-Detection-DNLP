@@ -1,0 +1,43 @@
+common:
+  device: auto
+
+train:
+  model_name: roberta-large
+  task: Sarcasm
+  train_file: ../dataset/train.csv
+  valid_file: ../dataset/valid.csv
+  output_dir: ./model_output
+
+  learning_rates: [1.0e-5]
+  batch_size: 8
+  eval_batch_size: null
+  num_epochs: 5
+  weight_decay: 0.01
+  seed: 42
+  use_class_weights: true
+
+  num_workers: 2
+  pin_memory: true
+  grad_accum_steps: 1
+  max_length: 256
+
+  fp16: false
+  bf16: false
+  tf32: false
+  
+  decoder_type: attn_pool
+  decoder_dropout: 0.1
+  attn_mlp_hidden: null   # or 256 for a tiny MLP scorer
+
+
+predict:
+  checkpoint_dir: ./model_output
+  input_file: null
+  output_file: null
+  text: []
+
+  device: auto
+  batch_size: 32
+  max_length: 256
+  fp16: false
+  bf16: false

@@ -1,0 +1,6 @@
+# config.yaml (ONLY the extra lines you add under train:)
+train:
+  decoder_type: cnn
+  decoder_dropout: 0.1
+  cnn_num_filters: 128
+  cnn_kernel_sizes: [2, 3, 4]

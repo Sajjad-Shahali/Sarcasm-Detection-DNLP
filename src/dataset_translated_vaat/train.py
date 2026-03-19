@@ -1,33 +1,40 @@
 """
 train.py
 
-Training script for BESSTIE (Sarcasm/Sentiment) with:
-- Standard HuggingFace head (baseline): AutoModelForSequenceClassification
-- Custom decoder heads (extension):
-    - CNN-over-tokens head
-    - Attention pooling head
+Config-first trainer used by main.py.
 
-Custom decoder checkpoints are saved in the SAME folder as the encoder/tokenizer,
-plus:
-  - decoder_config.json
-  - decoder_head.pt
+Supports:
+- Baseline HF head (decoder_type="hf_default")
+- Custom decoder heads on top of an encoder (decoder_type="cnn" | "attn_pool" | "vaat")
+
+And adds the "good stuff" you asked for (while keeping VAAT logic intact):
+- LR scheduling with warmup (linear by default; optional cosine)
+- Encoder + head dropout control
+- Freeze encoder option (works for baseline + custom heads)
+- Early stopping + best-epoch restore (per LR) and best-LR selection
+- FP16/BF16 + TF32 handling
+- Keeps the "variety" -> variety_id conditioning required by VAAT
+
+main.py calls: train_binary_model({"common":..., "train":...}, config_device=...)
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-from typing import Optional, Sequence, Dict, Any
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 
 from transformers import (
-    AutoModelForSequenceClassification,
+    AutoConfig,
     AutoModel,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
+    get_scheduler,
 )
 
 from utils import (
@@ -39,7 +46,7 @@ from utils import (
 )
 
 from decoders import DecoderConfig, build_head
-from model_io import EncoderWithCustomHead, save_custom_decoder_checkpoint
+from model_io import EncoderWithCustomHead
 
 
 def _pick_device(device: str) -> torch.device:
@@ -48,14 +55,14 @@ def _pick_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def _snapshot_state_dict_to_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+def _snapshot_state_dict_to_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
     """
-    Create a *safe* snapshot of model weights on CPU.
+    Safe snapshot of model weights on CPU.
 
-    Why not just v.detach().cpu()?
+    Important detail:
       - If training on CPU, .cpu() returns the SAME tensor (no copy),
-        so the "best" state would keep changing as training continues.
-      - We therefore clone() when already on CPU.
+        so the "best" snapshot would keep changing.
+      - We clone() on CPU to freeze the snapshot.
     """
     snap: Dict[str, torch.Tensor] = {}
     for k, v in model.state_dict().items():
@@ -67,74 +74,211 @@ def _snapshot_state_dict_to_cpu(model: torch.nn.Module) -> Dict[str, torch.Tenso
     return snap
 
 
-def train_binary_model(
-    model_name: str,
-    task: str,
+def save_custom_decoder_checkpoint(
     output_dir: str,
-    train_file: Optional[str] = None,
-    valid_file: Optional[str] = None,
-    learning_rates: Optional[Sequence[float]] = None,
-    batch_size: int = 8,
-    eval_batch_size: Optional[int] = None,
-    num_epochs: int = 30,
-    weight_decay: float = 0.01,
-    seed: int = 42,
-    use_class_weights: bool = True,
-    device: str = "auto",
-    num_workers: int = 2,
-    pin_memory: Optional[bool] = None,
-    grad_accum_steps: int = 1,
-    max_length: Optional[int] = None,
-    fp16: bool = False,
-    bf16: bool = False,
-    tf32: bool = False,
-    # ---- Best-epoch + Early stopping ----
-    early_stopping: bool = True,
-    patience: int = 3,
-    min_delta: float = 0.0,
-    monitor: str = "f1_macro",   # "f1_macro" or "accuracy"
-    # ---- Extension knobs ----
-    decoder_type: str = "hf_default",  # "hf_default" | "cnn" | "attn_pool"
-    decoder_dropout: float = 0.1,
-    cnn_num_filters: int = 128,
-    cnn_kernel_sizes: Optional[Sequence[int]] = None,
-    attn_mlp_hidden: Optional[int] = None,
-
-    # ---- VAAT (Variety-Aware Adapter Tuning) ----
-    vaat_adapter_dim: int = 64,
-    vaat_freeze_encoder: bool = True,
+    encoder: nn.Module,
+    tokenizer,
+    decoder_cfg: Dict[str, Any],
+    head: nn.Module,
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    if learning_rates is None:
-        learning_rates = (1e-5, 2e-5, 3e-5)
-    if cnn_kernel_sizes is None:
-        cnn_kernel_sizes = (2, 3, 4)
+    """
+    Save a custom-head checkpoint in the format expected by model_io.load_model_and_tokenizer():
 
-    if fp16 and bf16:
+      - encoder + tokenizer saved in HF format into output_dir
+      - decoder_head.pt           (state_dict of the head)
+      - decoder_config.json       (decoder_cfg dict; must include "decoder_type")
+      - (optional) decoder_metadata.json for extra run info
+
+    NOTE: We keep this here (instead of in model_io.py) to avoid touching inference/loading code.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    tokenizer.save_pretrained(output_dir)
+    encoder.save_pretrained(output_dir)
+
+    torch.save(head.state_dict(), os.path.join(output_dir, "decoder_head.pt"))
+
+    cfg_out = dict(decoder_cfg)
+    if "decoder_type" not in cfg_out:
+        raise ValueError("decoder_cfg must contain 'decoder_type'.")
+    with open(os.path.join(output_dir, "decoder_config.json"), "w", encoding="utf-8") as f:
+        import json
+        json.dump(cfg_out, f, indent=2)
+
+    if extra_metadata:
+        with open(os.path.join(output_dir, "decoder_metadata.json"), "w", encoding="utf-8") as f:
+            import json
+            json.dump(extra_metadata, f, indent=2)
+
+def _normalize_learning_rates(lrs: Any) -> Sequence[float]:
+    if lrs is None:
+        return (2e-5,)
+    if isinstance(lrs, (int, float, str)):
+        return (float(lrs),)
+    if isinstance(lrs, (list, tuple)):
+        return tuple(float(x) for x in lrs)
+    return (float(lrs),)
+
+
+def _extract_train_cfg(cfg: Dict[str, Any], config_device: Optional[str]) -> Dict[str, Any]:
+    t = cfg.get("train", {}) or {}
+    c = cfg.get("common", {}) or {}
+
+    out: Dict[str, Any] = {}
+
+    # Required-ish (main.py already ensures these exist; we keep safe defaults)
+    out["model_name"] = t.get("model_name")
+    out["task"] = t.get("task", "Sarcasm")
+    out["output_dir"] = t.get("output_dir", "./model_output")
+    out["train_file"] = t.get("train_file", None)
+    out["valid_file"] = t.get("valid_file", None)
+
+    # Optimization
+    out["learning_rates"] = _normalize_learning_rates(t.get("learning_rates", t.get("learning_rate", None)))
+    out["batch_size"] = int(t.get("batch_size", 8))
+    out["eval_batch_size"] = t.get("eval_batch_size", None)
+    out["eval_batch_size"] = int(out["eval_batch_size"]) if out["eval_batch_size"] is not None else out["batch_size"]
+    out["num_epochs"] = int(t.get("num_epochs", 30))
+    out["weight_decay"] = float(t.get("weight_decay", 0.01))
+    out["seed"] = int(t.get("seed", 42))
+    out["use_class_weights"] = bool(t.get("use_class_weights", True))
+
+    # Loader
+    out["num_workers"] = int(t.get("num_workers", 0))
+    out["pin_memory"] = t.get("pin_memory", None)
+    out["grad_accum_steps"] = int(t.get("grad_accum_steps", 1))
+    out["max_length"] = t.get("max_length", None)
+    out["max_length"] = int(out["max_length"]) if out["max_length"] is not None else None
+
+    # Precision
+    out["fp16"] = bool(t.get("fp16", False))
+    out["bf16"] = bool(t.get("bf16", False))
+    out["tf32"] = bool(t.get("tf32", False))
+
+    # Early stopping
+    out["early_stopping"] = bool(t.get("early_stopping", True))
+    out["patience"] = int(t.get("patience", 3))
+    out["min_delta"] = float(t.get("min_delta", 0.0))
+    out["monitor"] = str(t.get("monitor", "f1_macro"))
+
+    # ✅ "Good stuff"
+    out["warmup_ratio"] = float(t.get("warmup_ratio", 0.1))
+    out["num_warmup_steps"] = t.get("num_warmup_steps", None)  # if set, overrides warmup_ratio
+    out["scheduler_type"] = str(t.get("scheduler_type", "linear")).lower()  # linear | cosine | ...
+    out["lr_scheduler"] = str(t.get("lr_scheduler", out["scheduler_type"])).lower()  # accept either key
+
+    out["hidden_dropout"] = float(t.get("hidden_dropout", 0.1))
+    out["attention_dropout"] = float(t.get("attention_dropout", 0.1))
+    # head dropout: prefer decoder_dropout (existing key), else head_dropout, else hidden_dropout
+    out["decoder_dropout"] = float(t.get("decoder_dropout", t.get("head_dropout", out["hidden_dropout"])))
+    out["freeze_encoder"] = bool(t.get("freeze_encoder", False))
+
+    # Decoder / head
+    out["decoder_type"] = str(t.get("decoder_type", "hf_default"))
+    out["cnn_num_filters"] = int(t.get("cnn_num_filters", 128))
+    out["cnn_kernel_sizes"] = t.get("cnn_kernel_sizes", [2, 3, 4])
+    out["attn_mlp_hidden"] = t.get("attn_mlp_hidden", None)
+
+    # VAAT
+    out["vaat_adapter_dim"] = int(t.get("vaat_adapter_dim", 64))
+    out["vaat_freeze_encoder"] = bool(t.get("vaat_freeze_encoder", False))
+
+    # device
+    common_device = c.get("device", "auto")
+    out["device"] = config_device or t.get("device", common_device) or common_device or "auto"
+
+    return out
+
+
+def _build_enc_config(model_name: str, hidden_dropout: float, attention_dropout: float, classifier_dropout: Optional[float] = None):
+    enc_cfg = AutoConfig.from_pretrained(
+        model_name,
+        num_labels=2,
+        hidden_dropout_prob=float(hidden_dropout),
+        attention_probs_dropout_prob=float(attention_dropout),
+    )
+    # Some models support classifier_dropout
+    if classifier_dropout is not None and hasattr(enc_cfg, "classifier_dropout"):
+        try:
+            enc_cfg.classifier_dropout = float(classifier_dropout)
+        except Exception:
+            pass
+    return enc_cfg
+
+def train_binary_model(**kwargs):
+    """
+    Compatibility wrapper so old main.py (which passes flat kwargs)
+    still works with the new config-based trainer.
+    """
+
+    # Rebuild config dict from flat kwargs
+    cfg = {
+        "common": {
+            "device": kwargs.get("device", "auto")
+        },
+        "train": kwargs
+    }
+
+    return train_binary_model_config(cfg)
+def train_binary_model_config(cfg: Dict[str, Any], config_device: Optional[str] = None) -> None:
+    tr = _extract_train_cfg(cfg, config_device=config_device)
+
+    model_name = tr["model_name"]
+    if not model_name:
+        raise ValueError("train.model_name is required.")
+    task = tr["task"]
+    output_dir = tr["output_dir"]
+
+    # ----------------------------
+    # Device / seeds
+    # ----------------------------
+    dev = _pick_device(str(tr["device"]))
+    use_cuda = dev.type == "cuda"
+
+    if tr["fp16"] and tr["bf16"]:
         raise ValueError("Choose only one of fp16 or bf16.")
-    if monitor not in {"f1_macro", "accuracy"}:
+    if tr["monitor"] not in {"f1_macro", "accuracy"}:
         raise ValueError("monitor must be either 'f1_macro' or 'accuracy'.")
+
+    if tr["pin_memory"] is None:
+        tr["pin_memory"] = use_cuda
+
+    if tr["tf32"] and use_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    torch.manual_seed(int(tr["seed"]))
+    np.random.seed(int(tr["seed"]))
+    if use_cuda:
+        torch.cuda.manual_seed_all(int(tr["seed"]))
+        torch.backends.cudnn.benchmark = True
 
     # ----------------------------
     # Data
     # ----------------------------
-    if train_file and valid_file:
-        dataset = load_besstie_from_csv(train_file, valid_file, task=task)
+    if tr["train_file"] and tr["valid_file"]:
+        dataset = load_besstie_from_csv(tr["train_file"], tr["valid_file"], task=task)
     else:
         dataset = load_besstie_from_hf(task=task)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
     # VAAT needs the 'variety' column preserved to build variety_id conditioning.
-    extra_keep_cols = ["variety"] if str(decoder_type) == "vaat" else None
-    tokenised_dataset = prepare_dataset(tokenizer, dataset, max_length=max_length, extra_keep_columns=extra_keep_cols)
+    extra_keep_cols = ["variety"] if tr["decoder_type"] == "vaat" else None
+    tokenised = prepare_dataset(tokenizer, dataset, max_length=tr["max_length"], extra_keep_columns=extra_keep_cols)
 
     # ----------------------------
     # VAAT: map variety string -> variety_id
     # ----------------------------
     vaat_varieties = None
-    if str(decoder_type) == "vaat":
-        if "variety" not in tokenised_dataset["train"].column_names:
+    if tr["decoder_type"] == "vaat":
+        if "variety" not in tokenised["train"].column_names:
             raise ValueError("decoder_type=vaat requires a 'variety' column in the dataset.")
-        all_vars = list(tokenised_dataset["train"]["variety"]) + list(tokenised_dataset["validation"]["variety"])
+        all_vars = list(tokenised["train"]["variety"]) + list(tokenised["validation"]["variety"])
         vaat_varieties = sorted(list(set(map(str, all_vars))))
         variety_to_id = {v: i for i, v in enumerate(vaat_varieties)}
 
@@ -142,23 +286,23 @@ def train_binary_model(
             vs = [str(v) for v in batch["variety"]]
             return {"variety_id": [variety_to_id.get(v, 0) for v in vs]}
 
-        tokenised_dataset = tokenised_dataset.map(_add_variety_id, batched=True)
-        tokenised_dataset = tokenised_dataset.remove_columns(["variety"])
+        tokenised = tokenised.map(_add_variety_id, batched=True)
+        tokenised = tokenised.remove_columns(["variety"])
 
     # Class weights (optional)
     class_weights = None
-    if use_class_weights:
-        labels_arr = np.array(tokenised_dataset["train"]["label"])
+    if tr["use_class_weights"]:
+        labels_arr = np.array(tokenised["train"]["label"])
         class_weights = compute_class_weights(labels_arr)
 
     # Keep only needed columns
-    tokenised_dataset = tokenised_dataset.remove_columns([
-        c for c in tokenised_dataset["train"].column_names if c not in {"input_ids", "attention_mask", "label", "variety_id"}
-    ])
-    train_cols = [c for c in ["input_ids","attention_mask","label","variety_id"] if c in tokenised_dataset["train"].column_names]
-    val_cols   = [c for c in ["input_ids","attention_mask","label","variety_id"] if c in tokenised_dataset["validation"].column_names]
-    tokenised_dataset["train"].set_format(type="torch", columns=train_cols)
-    tokenised_dataset["validation"].set_format(type="torch", columns=val_cols)
+    keep = {"input_ids", "attention_mask", "label", "variety_id"}
+    tokenised = tokenised.remove_columns([c for c in tokenised["train"].column_names if c not in keep])
+
+    train_cols = [c for c in ["input_ids", "attention_mask", "label", "variety_id"] if c in tokenised["train"].column_names]
+    val_cols   = [c for c in ["input_ids", "attention_mask", "label", "variety_id"] if c in tokenised["validation"].column_names]
+    tokenised["train"].set_format(type="torch", columns=train_cols)
+    tokenised["validation"].set_format(type="torch", columns=val_cols)
 
     base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -179,40 +323,24 @@ def train_binary_model(
 
     from torch.utils.data import DataLoader
 
-    if eval_batch_size is None:
-        eval_batch_size = batch_size
-
-    dev = _pick_device(device)
-    use_cuda = dev.type == "cuda"
-    if pin_memory is None:
-        pin_memory = use_cuda
-
-    if tf32 and use_cuda:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-
     loader_kwargs = {
-        "num_workers": int(num_workers),
-        "pin_memory": bool(pin_memory),
-        "persistent_workers": int(num_workers) > 0,
+        "num_workers": int(tr["num_workers"]),
+        "pin_memory": bool(tr["pin_memory"]),
+        "persistent_workers": int(tr["num_workers"]) > 0,
     }
-    if int(num_workers) > 0:
+    if int(tr["num_workers"]) > 0:
         loader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
-        tokenised_dataset["train"],
-        batch_size=int(batch_size),
+        tokenised["train"],
+        batch_size=int(tr["batch_size"]),
         shuffle=True,
         collate_fn=collator,
         **loader_kwargs,
     )
     eval_loader = DataLoader(
-        tokenised_dataset["validation"],
-        batch_size=int(eval_batch_size),
+        tokenised["validation"],
+        batch_size=int(tr["eval_batch_size"]),
         shuffle=False,
         collate_fn=collator,
         **loader_kwargs,
@@ -225,21 +353,14 @@ def train_binary_model(
         def tqdm(x, *args, **kwargs):  # type: ignore
             return x
 
-    # Reproducibility
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
-    if use_cuda:
-        torch.cuda.manual_seed_all(int(seed))
-        torch.backends.cudnn.benchmark = True
-
     # Mixed precision
     autocast_dtype = None
-    if use_cuda and fp16:
+    if use_cuda and tr["fp16"]:
         autocast_dtype = torch.float16
-    elif use_cuda and bf16:
+    elif use_cuda and tr["bf16"]:
         autocast_dtype = torch.bfloat16
     use_autocast = autocast_dtype is not None
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda and fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda and tr["fp16"])
 
     # Loss
     if class_weights is not None:
@@ -251,106 +372,158 @@ def train_binary_model(
     else:
         loss_fct = CrossEntropyLoss()
 
-    # Track best across learning rates (final saved model)
-    best_f1_macro_global = -float("inf")
-    best_lr_global = None
-    best_model_global = None
+    # ----------------------------
+    # Helpers: build model per LR
+    # ----------------------------
+    
+    def build_model() -> Tuple[nn.Module, Optional[nn.Module], Optional[nn.Module], Optional[Dict[str, Any]]]:
+        """
+        Returns:
+          model_for_training,
+          encoder (if custom head) else None,
+          head (if custom head) else None,
+          decoder_cfg_dict (if custom head) else None
+        """
+        # Encoder config with dropout control
+        enc_cfg = _build_enc_config(
+            model_name=model_name,
+            hidden_dropout=tr["hidden_dropout"],
+            attention_dropout=tr["attention_dropout"],
+            classifier_dropout=(tr["decoder_dropout"] if tr["decoder_type"] == "hf_default" else None),
+        )
 
-    def build_model_for_lr() -> torch.nn.Module:
-        if decoder_type == "hf_default":
-            return AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+        if tr["decoder_type"] == "hf_default":
+            m = AutoModelForSequenceClassification.from_pretrained(model_name, config=enc_cfg)
+            # Freeze encoder if requested
+            if tr["freeze_encoder"]:
+                base_prefix = m.base_model_prefix
+                base_model = getattr(m, base_prefix)
+                for p in base_model.parameters():
+                    p.requires_grad = False
+            return m, None, None, None
 
-        # Custom head extension
-        encoder = AutoModel.from_pretrained(model_name)
-        hidden_size = getattr(encoder.config, "hidden_size", getattr(encoder.config, "d_model", None))
+        # Custom head: encoder + head
+        encoder = AutoModel.from_pretrained(model_name, config=enc_cfg)
+
+        hidden_size = getattr(enc_cfg, "hidden_size", getattr(enc_cfg, "d_model", None))
         if hidden_size is None:
             raise ValueError("Cannot infer hidden size from encoder config.")
         hidden_size = int(hidden_size)
 
         dec_cfg = DecoderConfig(
-            decoder_type=str(decoder_type),
+            decoder_type=str(tr["decoder_type"]),
             num_labels=2,
-            dropout=float(decoder_dropout),
-            cnn_num_filters=int(cnn_num_filters),
-            cnn_kernel_sizes=list(map(int, cnn_kernel_sizes)),
-            attn_mlp_hidden=attn_mlp_hidden,
-            vaat_adapter_dim=int(vaat_adapter_dim),
+            dropout=float(tr["decoder_dropout"]),
+            cnn_num_filters=int(tr["cnn_num_filters"]),
+            cnn_kernel_sizes=list(map(int, tr["cnn_kernel_sizes"])),
+            attn_mlp_hidden=tr["attn_mlp_hidden"],
+            vaat_adapter_dim=int(tr["vaat_adapter_dim"]),
             vaat_varieties=vaat_varieties,
         )
         head = build_head(hidden_size=hidden_size, cfg=dec_cfg)
+
         model = EncoderWithCustomHead(encoder=encoder, head=head)
-        if str(decoder_type) == "vaat" and bool(vaat_freeze_encoder):
+
+        # Freeze encoder option for custom head
+        if tr["freeze_encoder"] or (tr["decoder_type"] == "vaat" and tr["vaat_freeze_encoder"]):
             for p in model.encoder.parameters():
                 p.requires_grad = False
-        return model
+
+        return model, encoder, head, dec_cfg.to_dict()
 
     # ----------------------------
     # Train over LRs
     # ----------------------------
     from torch.optim import AdamW
 
-    for lr in learning_rates:
-        lr = float(lr)
-        print(f"\n*** Training with learning rate {lr} | decoder={decoder_type}")
+    best_f1_macro_global = -float("inf")
+    best_lr_global: Optional[float] = None
+    best_state_global: Optional[Dict[str, torch.Tensor]] = None
+    best_is_custom_global: bool = False
+    best_decoder_cfg_global: Optional[Dict[str, Any]] = None
+    best_epoch_global: int = 0
+    best_monitor_val_global: float = -float("inf")
 
-        model = build_model_for_lr()
+    # We'll rebuild and re-load best weights before saving (keeps memory sane)
+    for lr in tr["learning_rates"]:
+        lr = float(lr)
+        print(f"\n*** Training lr={lr} | decoder={tr['decoder_type']} | warmup={tr['warmup_ratio']} ***")
+
+        model, encoder_obj, head_obj, decoder_cfg_dict = build_model()
         model.to(dev)
 
-        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=float(tr["weight_decay"]))
 
-        # Best-epoch tracking (within this LR)
+        # Scheduler (warmup + chosen type)
+        num_update_steps_per_epoch = max(1, len(train_loader) // max(1, int(tr["grad_accum_steps"])))
+        max_train_steps = int(tr["num_epochs"] * num_update_steps_per_epoch)
+
+        if tr["num_warmup_steps"] is not None:
+            num_warmup_steps = int(tr["num_warmup_steps"])
+        else:
+            num_warmup_steps = int(max_train_steps * float(tr["warmup_ratio"]))
+
+        sched_name = str(tr["lr_scheduler"] or tr["scheduler_type"] or "linear").lower()
+        # transformers.get_scheduler expects canonical names like "linear", "cosine"
+        if sched_name not in {"linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"}:
+            # fallback to linear (safe)
+            sched_name = "linear"
+
+        scheduler = get_scheduler(
+            name=sched_name,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=max_train_steps,
+        )
+
+        # Early stopping / best-epoch snapshot for THIS LR
         best_metric_this_lr = -float("inf")
-        best_state_this_lr = None
+        best_state_this_lr: Optional[Dict[str, torch.Tensor]] = None
         best_epoch_this_lr = 0
-        best_metrics_this_lr: Optional[Dict[str, Any]] = None
         bad_epochs = 0
 
-        for epoch in range(int(num_epochs)):
+        for epoch in range(int(tr["num_epochs"])):
             model.train()
             epoch_loss = 0.0
             optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(
-                tqdm(train_loader, desc=f"LR {lr} Ep {epoch + 1}/{num_epochs} [Train]"),
+                tqdm(train_loader, desc=f"LR {lr} Ep {epoch + 1}/{tr['num_epochs']} [Train]"),
                 start=1,
             ):
                 batch = {k: v.to(dev, non_blocking=use_cuda) for k, v in batch.items()}
 
-                if "label" in batch:
-                    labels = batch.pop("label")
-                elif "labels" in batch:
-                    labels = batch.pop("labels")
-                else:
-                    raise KeyError(f"Missing label key in batch. Keys={list(batch.keys())}")
-
+                labels = batch.pop("label")
                 with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
                     outputs = model(**batch)
                     logits = outputs.logits
                     loss = loss_fct(logits.view(-1, 2), labels.view(-1))
-                    loss = loss / max(1, int(grad_accum_steps))
+                    loss = loss / max(1, int(tr["grad_accum_steps"]))
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
-                epoch_loss += loss.item() * max(1, int(grad_accum_steps))
+                epoch_loss += loss.item() * max(1, int(tr["grad_accum_steps"]))
 
-                if step % max(1, int(grad_accum_steps)) == 0:
+                if step % max(1, int(tr["grad_accum_steps"])) == 0:
                     if scaler.is_enabled():
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
             # flush remaining grads
-            if len(train_loader) % max(1, int(grad_accum_steps)) != 0:
+            if len(train_loader) % max(1, int(tr["grad_accum_steps"])) != 0:
                 if scaler.is_enabled():
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             avg_loss = epoch_loss / max(1, len(train_loader))
@@ -362,208 +535,115 @@ def train_binary_model(
             all_logits = []
             all_labels = []
             with torch.inference_mode():
-                for batch in tqdm(eval_loader, desc=f"LR {lr} Ep {epoch + 1}/{num_epochs} [Val]"):
+                for batch in tqdm(eval_loader, desc=f"LR {lr} Ep {epoch + 1}/{tr['num_epochs']} [Val]"):
                     batch = {k: v.to(dev, non_blocking=use_cuda) for k, v in batch.items()}
-                    if "label" in batch:
-                        val_labels = batch.pop("label")
-                    elif "labels" in batch:
-                        val_labels = batch.pop("labels")
-                    else:
-                        raise KeyError("Missing label key during validation.")
+                    val_labels = batch.pop("label")
 
                     with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
                         outputs = model(**batch)
                         logits_val = outputs.logits
 
-                    all_logits.append(logits_val.detach().cpu().numpy())
+                    # IMPORTANT: float() avoids BF16 -> numpy issues
+                    all_logits.append(logits_val.detach().float().cpu().numpy())
                     all_labels.append(val_labels.detach().cpu().numpy())
 
-            all_logits_np = np.concatenate(all_logits, axis=0)
-            all_labels_np = np.concatenate(all_labels, axis=0)
-            metrics = compute_metrics((all_logits_np, all_labels_np))
+            logits_np = np.concatenate(all_logits, axis=0)
+            labels_np = np.concatenate(all_labels, axis=0)
+            metrics = compute_metrics((logits_np, labels_np))
 
-            if monitor not in metrics:
-                raise KeyError(f"monitor='{monitor}' not found in metrics keys={list(metrics.keys())}")
-
+            current_metric = float(metrics[tr["monitor"]])
             print(
-                f"LR {lr} Ep {epoch + 1}/{num_epochs} | loss={avg_loss:.4f} | "
-                f"acc={metrics['accuracy']:.4f} | f1_macro={metrics['f1_macro']:.4f}"
+                f"LR {lr} Ep {epoch + 1}/{tr['num_epochs']} | loss={avg_loss:.4f} | "
+                f"acc={metrics['accuracy']:.4f} | f1_macro={metrics['f1_macro']:.4f} | "
+                f"{tr['monitor']}={current_metric:.4f}"
             )
 
-            current_metric = float(metrics[monitor])
-
-            # Update best-epoch snapshot (in-memory, no disk IO)
-            if current_metric > (best_metric_this_lr + float(min_delta)):
+            # Best-epoch snapshot (in-memory)
+            if current_metric > (best_metric_this_lr + float(tr["min_delta"])):
                 best_metric_this_lr = current_metric
                 best_epoch_this_lr = epoch + 1
-                best_metrics_this_lr = dict(metrics)
                 best_state_this_lr = _snapshot_state_dict_to_cpu(model)
                 bad_epochs = 0
             else:
                 bad_epochs += 1
 
-            if early_stopping and bad_epochs >= int(patience):
+            if tr["early_stopping"] and bad_epochs >= int(tr["patience"]):
                 print(
                     f"Early stopping at epoch {epoch + 1}. "
-                    f"Best epoch was {best_epoch_this_lr} with {monitor}={best_metric_this_lr:.4f}"
+                    f"Best epoch was {best_epoch_this_lr} with {tr['monitor']}={best_metric_this_lr:.4f}"
                 )
                 break
 
-        # Restore best epoch weights for this LR (so the saved model is best-epoch)
+        # Restore best weights for this LR
         if best_state_this_lr is not None:
             model.load_state_dict(best_state_this_lr)
-            # free snapshot (optional)
-            del best_state_this_lr
 
-        # Choose which model to keep globally (by best-epoch macro-F1)
-        # If you monitor accuracy, we still rank LRs by macro-F1 at the (best) monitored epoch.
-        if best_metrics_this_lr is not None:
-            f1_macro_this_lr = float(best_metrics_this_lr.get("f1_macro", -float("inf")))
-        else:
-            # fallback (shouldn't happen)
-            f1_macro_this_lr = float(metrics["f1_macro"])
+        # Rank LRs by macro-F1 (stable and paper-aligned)
+        f1_macro_this_lr = float(metrics.get("f1_macro", -float("inf")))
 
         if f1_macro_this_lr > best_f1_macro_global:
-            if best_model_global is not None:
-                del best_model_global
-                if use_cuda:
-                    torch.cuda.empty_cache()
-
             best_f1_macro_global = f1_macro_this_lr
             best_lr_global = lr
-            best_model_global = model
+            best_state_global = _snapshot_state_dict_to_cpu(model)
+            best_is_custom_global = (tr["decoder_type"] != "hf_default")
+            best_decoder_cfg_global = decoder_cfg_dict
             best_epoch_global = best_epoch_this_lr
             best_monitor_val_global = best_metric_this_lr
-            best_monitor_global = monitor
-        else:
-            del model
-            if use_cuda:
-                torch.cuda.empty_cache()
+
+        # cleanup
+        del model
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+    if best_lr_global is None or best_state_global is None:
+        raise RuntimeError("Training produced no model (unexpected).")
 
     # ----------------------------
     # Save best (across LRs)
     # ----------------------------
     os.makedirs(output_dir, exist_ok=True)
-    if best_model_global is None:
-        raise RuntimeError("Training produced no model (unexpected).")
 
-    if decoder_type == "hf_default":
-        best_model_global.save_pretrained(output_dir)
+    # Rebuild a fresh model and load best weights (so we can save cleanly)
+    model, encoder_obj, head_obj, decoder_cfg_dict = build_model()
+    model.load_state_dict(best_state_global)
+    model.to(dev)
+
+    if tr["decoder_type"] == "hf_default":
+        assert isinstance(model, AutoModelForSequenceClassification) or hasattr(model, "save_pretrained")
+        model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
         print(
-            f"Saved HF default model to {output_dir} | best_lr={best_lr_global} | "
+            f"Saved HF model to {output_dir} | best_lr={best_lr_global} | "
             f"best_epoch={best_epoch_global} | f1_macro={best_f1_macro_global:.4f}"
         )
         return
 
     # Custom decoder checkpoint
-    dec_cfg = DecoderConfig(
-        decoder_type=str(decoder_type),
-        num_labels=2,
-        dropout=float(decoder_dropout),
-        cnn_num_filters=int(cnn_num_filters),
-        cnn_kernel_sizes=list(map(int, cnn_kernel_sizes)),
-        attn_mlp_hidden=attn_mlp_hidden,
-        vaat_adapter_dim=int(vaat_adapter_dim),
-        vaat_varieties=vaat_varieties,
-    ).to_dict()
+    if encoder_obj is None or head_obj is None or best_decoder_cfg_global is None:
+        # Fallback: split model if needed
+        if hasattr(model, "encoder") and hasattr(model, "head"):
+            encoder_obj = model.encoder
+            head_obj = model.head
+        else:
+            raise RuntimeError("Custom-head save requested but encoder/head not found.")
+
+    extra_metadata = {
+        "best_lr": float(best_lr_global),
+        "best_epoch": int(best_epoch_global),
+        "best_f1_macro": float(best_f1_macro_global),
+        "monitor": str(tr["monitor"]),
+        "best_monitor_val": float(best_monitor_val_global),
+    }
 
     save_custom_decoder_checkpoint(
         output_dir=output_dir,
-        encoder=best_model_global.encoder,
+        encoder=encoder_obj,
         tokenizer=tokenizer,
-        decoder_cfg=dec_cfg,
-        head=best_model_global.head,
-        extra_metadata={
-            "best_lr": best_lr_global,
-            "best_epoch": best_epoch_global,
-            "monitor": best_monitor_global,
-            "best_monitor_value": best_monitor_val_global,
-            "best_f1_macro": best_f1_macro_global,
-        },
+        decoder_cfg=best_decoder_cfg_global,
+        head=head_obj,
+        extra_metadata=extra_metadata,
     )
     print(
-        f"Saved custom-decoder model to {output_dir} | best_lr={best_lr_global} | "
+        f"Saved custom decoder checkpoint to {output_dir} | best_lr={best_lr_global} | "
         f"best_epoch={best_epoch_global} | f1_macro={best_f1_macro_global:.4f}"
     )
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train BESSTIE classifier with optional custom decoder heads.")
-    parser.add_argument("--model_name", type=str, default="roberta-large")
-    parser.add_argument("--task", type=str, choices=["Sentiment", "Sarcasm"], default="Sarcasm")
-    parser.add_argument("--train_file", type=str)
-    parser.add_argument("--valid_file", type=str)
-    parser.add_argument("--output_dir", type=str, default="./model_output")
-    parser.add_argument("--learning_rates", type=float, nargs="+", default=[1e-5, 2e-5, 3e-5])
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--eval_batch_size", type=int)
-    parser.add_argument("--num_epochs", type=int, default=30)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no_class_weights", action="store_true")
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--no_pin_memory", action="store_true")
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--max_length", type=int)
-    parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--bf16", action="store_true")
-    parser.add_argument("--tf32", action="store_true")
-
-    # ---- Early stopping / best epoch ----
-    parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--patience", type=int, default=3)
-    parser.add_argument("--min_delta", type=float, default=0.0)
-    parser.add_argument("--monitor", type=str, default="f1_macro", choices=["f1_macro", "accuracy"])
-
-    # extension flags
-    parser.add_argument("--decoder_type", type=str, default="hf_default", choices=["hf_default", "cnn", "attn_pool", "vaat"])
-    parser.add_argument("--decoder_dropout", type=float, default=0.1)
-    parser.add_argument("--cnn_num_filters", type=int, default=128)
-    parser.add_argument("--cnn_kernel_sizes", type=int, nargs="+", default=[2, 3, 4])
-    parser.add_argument("--attn_mlp_hidden", type=int, default=None)
-
-    # VAAT
-    parser.add_argument("--vaat_adapter_dim", type=int, default=64)
-    parser.add_argument("--vaat_freeze_encoder", action="store_true")
-
-    args = parser.parse_args()
-
-    train_binary_model(
-        model_name=args.model_name,
-        task=args.task,
-        output_dir=args.output_dir,
-        train_file=args.train_file,
-        valid_file=args.valid_file,
-        learning_rates=args.learning_rates,
-        batch_size=args.batch_size,
-        eval_batch_size=args.eval_batch_size,
-        num_epochs=args.num_epochs,
-        weight_decay=args.weight_decay,
-        seed=args.seed,
-        use_class_weights=not args.no_class_weights,
-        device=args.device,
-        num_workers=args.num_workers,
-        pin_memory=False if args.no_pin_memory else None,
-        grad_accum_steps=args.grad_accum_steps,
-        max_length=args.max_length,
-        fp16=args.fp16,
-        bf16=args.bf16,
-        tf32=args.tf32,
-
-        early_stopping=bool(args.early_stopping),
-        patience=int(args.patience),
-        min_delta=float(args.min_delta),
-        monitor=str(args.monitor),
-
-        decoder_type=args.decoder_type,
-        decoder_dropout=args.decoder_dropout,
-        cnn_num_filters=args.cnn_num_filters,
-        cnn_kernel_sizes=args.cnn_kernel_sizes,
-        attn_mlp_hidden=args.attn_mlp_hidden,
-    )
-
-
-if __name__ == "__main__":
-    main()

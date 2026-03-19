@@ -149,7 +149,7 @@ def evaluate_model(
     df["prediction"] = preds
 
     # -----------------------------
-    # Error samples (per-variety) - keep as before
+    # Error samples (per-variety)
     # -----------------------------
     errors = df[df["label"] != df["prediction"]].copy()
     errors["model"] = model_name
@@ -161,7 +161,7 @@ def evaluate_model(
     all_variety_source = []
 
     # -----------------------------
-    # 1) Per-variety metrics (same as before, but now richer columns)
+    # 1) Per-variety metrics (+ Robustness & Latency)
     # -----------------------------
     if save_per_variety:
         per_variety = _compute_group_metrics(
@@ -170,10 +170,44 @@ def evaluate_model(
             model_name=model_name,
             min_group_size=min_group_size,
         )
+
+        # === تغییرات اضافه شده از اینجا شروع می‌شود ===
+        
+        # A) محاسبه Robustness Gap (تفاوت بیشترین و کمترین F1 در بین واریته‌ها)
+        f1s = [r["f1_macro"] for r in per_variety]
+        if len(f1s) > 0:
+            per_variety.append(
+                {
+                    "model": model_name,
+                    "variety": "__ROBUSTNESS_GAP__",
+                    "num_samples": int(df.shape[0]),
+                    "accuracy": None,
+                    "f1_macro": float(max(f1s) - min(f1s)), # ذخیره گپ در ستون F1
+                    "precision": None,
+                    "recall": None,
+                    "tp": None, "fp": None, "fn": None, "tn": None,
+                }
+            )
+
+        # B) اضافه کردن Latency (زمان تاخیر)
+        per_variety.append(
+            {
+                "model": model_name,
+                "variety": "__LATENCY_MS_PER_SAMPLE__",
+                "num_samples": int(df.shape[0]),
+                "accuracy": None,
+                "f1_macro": float(latency_ms), # ذخیره زمان در ستون F1 طبق فرمت تصویر شما
+                "precision": None,
+                "recall": None,
+                "tp": None, "fp": None, "fn": None, "tn": None,
+            }
+        )
+        # === پایان تغییرات ===
+
         all_variety.extend(per_variety)
 
     # -----------------------------
-    # 2) Per-source metrics (new)
+    # 2) Per-source metrics
     # -----------------------------
     if save_per_source:
         per_source = []
@@ -187,7 +221,7 @@ def evaluate_model(
         all_source.extend(per_source)
 
     # -----------------------------
-    # 3) Per-variety × per-source metrics (new)
+    # 3) Per-variety × per-source metrics
     # -----------------------------
     if save_per_variety_source:
         per_variety_source = []
@@ -203,18 +237,21 @@ def evaluate_model(
     # Saving all output based on the flags
     if save_all:
         if len(all_variety) > 0:
-            out_variety = pd.DataFrame(all_variety).sort_values(["model", "variety"], ascending=[True, True])
-            out_variety.to_csv(f"results\{model_name}_per_variety.csv", index=False)
+            out_variety = pd.DataFrame(all_variety)
+            
+            out_variety = out_variety.sort_values(["model", "variety"], ascending=[True, True])
+            
+            out_variety.to_csv(f"results/{model_name}_per_variety.csv", index=False)
             print(f"Saved: {model_name}_per_variety.csv")
 
         if len(all_source) > 0:
             out_source = pd.DataFrame(all_source).sort_values(["model", "source"], ascending=[True, True])
-            out_source.to_csv(f"results\{model_name}_per_source.csv", index=False)
+            out_source.to_csv(f"results/{model_name}_per_source.csv", index=False)
             print(f"Saved: {model_name}_per_source.csv")
 
         if len(all_variety_source) > 0:
             out_vs = pd.DataFrame(all_variety_source).sort_values(["model", "variety", "source"], ascending=[True, True, True])
-            out_vs.to_csv(f"results\{model_name}_per_variety_source.csv", index=False)
+            out_vs.to_csv(f"results/{model_name}_per_variety_source.csv", index=False)
             print(f"Saved: {model_name}_per_variety_source.csv")
     else:
         print("No outputs will be saved.")

@@ -3,14 +3,14 @@ common:
 train:
   model_name: roberta-large
   task: Sarcasm
-  train_file: ./dataset/train-new.csv
-  valid_file: ./dataset/valid-new.csv
+  train_file: ./dataset/train-not-translated.csv
+  valid_file: ./dataset/valid-not-translated.csv
   output_dir: ./model_output
   learning_rates:
-  - 1.0e-05
+ 
   - 2.0e-05
-  - 3.0e-05
-  batch_size: 8
+
+  batch_size: 16
   eval_batch_size: null
   num_epochs: 30
   weight_decay: 0.01
@@ -21,8 +21,8 @@ train:
   grad_accum_steps: 1
   max_length: 256
   fp16: false
-  bf16: false
-  tf32: false
+  bf16: true
+  tf32: true
   decoder_type: vaat
   decoder_dropout: 0.1
   cnn_num_filters: 128
@@ -34,7 +34,7 @@ train:
   vaat_adapter_dim: 64
   vaat_freeze_encoder: true
   early_stopping: true
-  patience: 5
+  patience: 10
   min_delta: 0.001
   monitor: f1_macro
 predict:
@@ -46,4 +46,4 @@ predict:
   batch_size: 32
   max_length: 256
   fp16: false
-  bf16: false
+  bf16: true

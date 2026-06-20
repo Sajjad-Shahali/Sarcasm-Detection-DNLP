@@ -1,0 +1,94 @@
+common:
+  # Device for training. "auto" -> cuda if available else cpu
+  device: auto
+
+train:
+  # -----------------------
+  # Dataset / I/O
+  # -----------------------
+  model_name: roberta-large
+  task: Sarcasm
+
+  train_file: ./dataset/train-translated.csv
+  valid_file: ./dataset/valid-translated.csv
+  output_dir: ./model_output
+
+
+  #decoder_type: attn_pool
+  #decoder_dropout: 0.1
+  #attn_mlp_hidden: null   # or 256 for a tiny MLP scorer
+
+
+  decoder_type: cnn
+  decoder_dropout: 0.1
+  cnn_num_filters: 128
+  cnn_kernel_sizes: [2, 3, 4]
+
+
+
+  # Attention-pooling score
+  # -----------------------
+  # Optimization
+  # -----------------------
+  # Can be a single float OR a list for multi-run sweeps:
+  #   learning_rates: 2.0e-5
+  #   learning_rates: [2.0e-5, 3.0e-5]
+  learning_rates: [5.0e-6]
+
+  batch_size: 16
+  eval_batch_size: null          # null -> uses batch_size
+  num_epochs: 30
+  weight_decay: 0.01
+  seed: 42
+  use_class_weights: true
+
+  # DataLoader
+  num_workers: 0
+  pin_memory: true
+  grad_accum_steps: 1
+  max_length: 128
+
+  # -----------------------
+  # Mixed precision / math
+  # -----------------------
+  # Choose ONE of fp16 or bf16
+  fp16: false
+  bf16: true
+  tf32: true
+
+  # -----------------------
+  # "Good stuff" from baseline train.py
+  # -----------------------
+  # Linear LR schedule with warmup_ratio * total_steps
+  warmup_ratio: 0.15
+
+  # Encoder dropout controls (applied via HF config)
+  hidden_dropout: 0.10
+  attention_dropout: 0.10
+
+  # If true: freeze encoder weights, train only the head
+  freeze_encoder: false
+
+  # Optional alternative key (if you prefer); used if decoder_dropout is not set:
+  # head_dropout: 0.10
+
+  # -----------------------
+  # Early stopping
+  # -----------------------
+  early_stopping: true
+  patience: 10
+  min_delta: 0.001
+  monitor: f1_macro           # supported: f1_macro, accuracy
+
+predict:
+  checkpoint_dir: ./model_output
+  input_file: null
+  output_file: null
+  text: []
+
+  device: auto
+  batch_size: 32
+  max_length: 256
+  fp16: false
+  bf16: true
+
